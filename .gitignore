@@ -1,5 +1,6 @@
 # Project specific
 share/
+bigram/bigram_model.npy
 
 # macOS - python
 .DS_Store
