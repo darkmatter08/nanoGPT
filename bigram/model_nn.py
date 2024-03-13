@@ -1,19 +1,7 @@
 """
 A bigram language model just predicts the next token, conditioned on the previous token only. It does not consider any other tokens.
 
-This implementation will use a NxN matrix, where N is the vocab size.
-The matrix will be trained by going over every adjacent token pair in the dataset, and iterating the count in the matrix.
-
-Math:
-matrix[r,c]
-r will be the "input word".
-c will be the "output word".
-
-Probability of c following r:
-p(c | r) = matrix[r, c] / sum(matrix[r, :])
-
-The full probability distribution for sampling (generative inference):
-p(c = C | r) = matrix[r, C] / sum(matrix[r, :])
+This implementation will use a 3 layer MLP that is trained on next token prediction.
 """
 
 import numpy as np
@@ -104,7 +92,6 @@ class Network(torch.nn.Module):
 model = Network()
 # Because we use CrossEntropyLoss, we don't apply a Softmax on the final output of the model. It should be un-normalized.
 loss_fn = torch.nn.CrossEntropyLoss()
-# loss_fn = torch.nn.NLLLoss()
 
 
 if RELOAD_MODEL and os.path.exists(MODEL_SAVEPATH):
@@ -134,10 +121,6 @@ else:
             print(f"{iter=:05} {loss_scalar=:.6f}")
 
     torch.save(model.state_dict(), MODEL_SAVEPATH)
-
-
-
-# WHY is it not training? is there something wrong in the loss function computation?
 
 
 ## Evals
