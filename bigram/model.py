@@ -25,7 +25,7 @@ from tqdm import tqdm
 # TODO: Allow overriding these from a config file or cmdline
 # Model Config
 MODEL_SAVEPATH: str = "bigram_model.npy"
-RELOAD_MODEL: bool = True
+RELOAD_MODEL: bool = False
 
 # Sampling Config
 STARTING_CHAR: str = "T"
@@ -34,9 +34,11 @@ TOKENS_TO_SAMPLE: int = 1_000
 
 
 ## Load dataset and override VOCAB_SIZE
-train_tokens = np.memmap("train.bin", dtype=np.uint16, mode='r')
-test_tokens = np.memmap("test.bin", dtype=np.uint16, mode='r')
-with open("meta.pkl", "rb") as f:
+prefix = "./"
+prefix = "/Users/jains/code/nanoGPT/data/world192"
+train_tokens = np.memmap(os.path.join(prefix, "train.bin"), dtype=np.int16, mode='r')
+test_tokens = np.memmap(os.path.join(prefix, "test.bin"), dtype=np.int16, mode='r')
+with open(os.path.join(prefix, "meta.pkl"), "rb") as f:
     meta = pickle.load(f)
 
 VOCAB_SIZE = len(set(train_tokens))
