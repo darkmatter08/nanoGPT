@@ -121,6 +121,8 @@ def get_batch(split):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
+    # Could pre-shuffle data in train.bin and save it as a torch.tensor.
+    # Unclear if it will speed it up much. But it will fix the shuffle at an earlier point, not relying on the manual_seed()
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
