@@ -32,9 +32,12 @@ MOMENTUM: float = 0.90
 EVAL: bool = True
 SAMPLE: bool = True
 
+DEVICE: str = "mps"  # options: "cpu" "mps" "gpu"
+COMPILE: bool = False  # torch.compile doesn't work on python >=3.12
+
 ## Load dataset
-prefix = "./"
-prefix = "/Users/jains/code/nanoGPT/data/world192"
+# prefix = "./"  # shakespear-char using my own tokenization impl
+prefix = "/Users/jains/code/nanoGPT/data/world192"  # cia-world-factbook + bible
 train_tokens = np.memmap(os.path.join(prefix, "train.bin"), dtype=np.int16, mode='r')
 test_tokens = np.memmap(os.path.join(prefix, "test.bin"), dtype=np.int16, mode='r')
 with open(os.path.join(prefix, "meta.pkl"), "rb") as f:
@@ -90,6 +93,10 @@ class Network(torch.nn.Module):
 
 
 model = Network()
+model.to(DEVICE)
+if COMPILE:
+    print("compiling the model... (takes a ~minute)")
+    model = torch.compile(model)
 # Because we use CrossEntropyLoss, we don't apply a Softmax on the final output of the model. It should be un-normalized.
 loss_fn = torch.nn.CrossEntropyLoss()
 
@@ -103,6 +110,8 @@ else:
 
     for iter in range(TRAIN_ITERS):
         batch_inputs, batch_outputs = make_batch()
+        batch_inputs = batch_inputs.to(DEVICE)
+        batch_outputs = batch_outputs.to(DEVICE)
 
         optimizer.zero_grad()
 
@@ -116,7 +125,7 @@ else:
         # apply loss
         optimizer.step()
 
-        loss_scalar = loss.item() / BATCH_SIZE
+        loss_scalar = loss.cpu().item() / BATCH_SIZE
         if iter % 10 == 0:
             print(f"{iter=:05} {loss_scalar=:.6f}")
 
@@ -131,10 +140,12 @@ if EVAL:
         EVAL_ITERS = 100
         for _ in range(EVAL_ITERS):  # TODO: figure out how to not shuffle
             batch_inputs, batch_outputs = make_batch(test=True)
+            batch_inputs = batch_inputs.to(DEVICE)
+            batch_outputs = batch_outputs.to(DEVICE)
             pred = model(batch_inputs)
             loss = loss_fn(pred, batch_outputs)
 
-            loss_scalar = loss.numpy().item()
+            loss_scalar = loss.cpu().item()
             total_loss += loss_scalar
 
         total_loss /= (EVAL_ITERS * BATCH_SIZE)
@@ -148,12 +159,13 @@ if SAMPLE:
     result = STARTING_CHAR
     while len(result) - 1 < TOKENS_TO_SAMPLE:
         last_token = ctoi(result[-1])
-        ltt = torch.tensor(last_token)
+        ltt = torch.tensor(last_token).to(DEVICE)
         ltt = ltt.unsqueeze(0)
         with torch.no_grad():
             prob_distribution = model(ltt)
             prob_distribution = torch.nn.functional.softmax(prob_distribution, dim=-1)
         prob_distribution = torch.squeeze(prob_distribution) / torch.sum(prob_distribution)
+        prob_distribution = prob_distribution.cpu()
         sampled_token = np.random.choice([i for i in range(VOCAB_SIZE)], p=prob_distribution.numpy())  # TODO: multiple sampling and beam search or nucleus sampling
         result += itoc(sampled_token)
 
