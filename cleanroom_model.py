@@ -25,7 +25,8 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
-        raise NotImplementedError
+        return F.layer_norm(input, normalized_shape=self.weight.shape, weight=self.weight, bias=self.bias)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -40,25 +41,73 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
-        self.n_embd = config.n_embd
+        self.n_embd = config.n_embd  # d_model
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = False
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
+            # block_size means the sequence length (T)
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+            # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)))
 
     def forward(self, x):
-        x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        raise NotImplementedError
+        # (B x T x C), but right now we are doing single head, batch=1.
+        # TODO: where does n_head fit in here?
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # print(f"{B=} {T=} {C=}") # (batch size, sequence length, embedding dimensionality (n_embd))
 
-        return y
+        assert self.n_embd == C  # Double check this. True?
+        assert self.n_embd % self.n_head == 0
+        d_head: int = self.n_embd // self.n_head
+        assert self.n_embd / self.n_head == d_head
+
+        x = self.c_attn(x)
+        # unpack x into q, k, v
+        q, k, v = torch.split(x, [self.n_embd] * 3, dim=-1)
+        # print(f"{q.shape=}")  # (B, T, C=self.n_embd)
+        # print(f"{k.shape=}")  # (B, T, C=self.n_embd)
+        # print(f"{v.shape=}")  # (B, T, C=self.n_embd)
+
+        # Now reshape these into different heads
+        # (B, nh, T, hs)
+        q = q.view((B, T, self.n_head, d_head)).transpose(1, 2)  # (B, n_heads, T, d_head)
+        k = k.view((B, T, self.n_head, d_head)).transpose(1, 2)  # (B, n_heads, T, d_head)
+        v = v.view((B, T, self.n_head, d_head)).transpose(1, 2)  # (B, n_heads, T, d_head)
+
+        # What is the point of extra heads? It's just reshaping, there shouldn't be a real difference since the # params are the same.
+
+        # print(f"{q.shape=}")  # (B, n_heads, T, d_head)
+        # print(f"{k.shape=}")  # (B, n_heads, T, d_head)
+        # print(f"{v.shape=}")  # (B, n_heads, T, d_head)
+        # k.transpose(-2, -1)  # (B, n_heads, d_head, T)
+        # q @ k.transpose(-2, -1)  # (B, n_heads, T, T)
+
+        # z = ((q @ k.T) / torch.sqrt(self.n_emb)) @ v
+        z = (q @ k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.n_embd, device=x.device))
+        # print(f"{z.shape=}")  # expecting: (B, n_heads, T, T)
+        masked_qk = torch.where(self.bias > 0, z, -torch.inf)  # broadcast over the batch and n_heads dimension
+        masked_qk = F.softmax(masked_qk, dim=-1)  # TODO: is this the right dimension?
+        # print(f"{masked_qk.shape=}")
+        z = masked_qk @ v  # (B, n_heads, T, T) @ (B, n_heads, T, d_head) = (B, n_heads, T, d_head)
+        # print(f"{z.shape=}")  # ([12, 4, 64, 32])  # (B, n_head, T, d_head)
+        # Flatten out the head dimension
+        # We should really be concating the heads...
+        z = z.transpose(1, 2).reshape((B, T, self.n_embd))  # (B, n_head, T, d_head) > (B, T, n_head, d_head) > (B, T, n_head, d_head)
+        # print(f"{z.shape=}")
+
+        z = self.c_proj(z)  # (B, T, d_model) @ (d_model, d_model) = (B, T, d_model)
+        # print(f"{z.shape=}")
+        return F.dropout(z, p=self.dropout)
+
 
 class MLP(nn.Module):
 
     def __init__(self, config):
+        # n_embd == d_model
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu = nn.GELU()
@@ -66,7 +115,9 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        raise NotImplementedError
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
         return x
 
 class Block(nn.Module):
@@ -79,8 +130,10 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        raise NotImplementedError
-        return x
+        z = self.attn(x)
+        z2 = self.ln_1(x + z)
+        z = self.mlp(z2)
+        return self.ln_2(x + z)
 
 @dataclass
 class GPTConfig:
@@ -102,7 +155,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),  # learned positional encodings, instead of sinusoid.
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -147,7 +200,26 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        raise NotImplementedError
+
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # indexes corresponding to positions
+
+        x = self.transformer.wte(idx)
+        x = x + self.transformer.wpe(pos)
+        x = self.transformer.drop(x)
+        for block in self.transformer.h:
+            # TODO: Make 8 heads and append their results all together.
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        # TODO: inference-time mini-optimization: only forward the lm_head on the very last position
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None:
+            # don't normalize outputs because we're using a CrossEntropyLoss
+            # TODO: reshape as necessary. cross_entropy only accepts 2d or 4d 
+            # logits is expected to be (C) or (B, C). So we typically have to flatten `logits` into (batch*time, vocab_size)
+            # logits.shape=torch.Size([12, 64, 65]) targets.shape=torch.Size([12, 64])
+            loss = F.cross_entropy(logits.view(b*t, -1), targets.view(b*t))
         return logits, loss
 
     def crop_block_size(self, block_size):
