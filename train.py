@@ -27,8 +27,9 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+# from model import GPTConfig, GPT
 # from cleanroom_model import GPTConfig, GPT
+from cleanroom_model2 import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -223,8 +224,8 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            # X.shape=torch.Size([12, 64])
-            # Y.shape=torch.Size([12, 64])
+            # X.shape=torch.Size([12, 64])  (B x T)
+            # Y.shape=torch.Size([12, 64])  (B x T)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
