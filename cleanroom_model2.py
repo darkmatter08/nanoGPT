@@ -1,10 +1,7 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+Deleted and re-implemented the forward() functions for each of these modules.
+Copied from `model.py`
+TODO: add the causal self-attention mask to CausalSelfAttention
 """
 
 import inspect
@@ -25,7 +22,8 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
-        pass
+        normalized_shape = (input.shape[-1], )  # TODO: I'm not sure about this... Do we have to drop the batch dimension out of this? what is the relationship to `ndim`?
+        return torch.nn.functional.layer_norm(input, normalized_shape=normalized_shape, weight=self.weight, bias=self.bias)
 
 class CausalSelfAttention(nn.Module):
 
@@ -44,20 +42,74 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        self.flash = False
+        self.flash = False  # We want to implement self attention manually.
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             # block_size means the sequence length (T)
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
-            # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)))
+
+        assert self.n_embd % self.n_head == 0
+        self.d_head = self.n_embd // self.n_head
+        # for loop style only
+        self.c_attn_array = [
+            nn.Linear(config.n_embd, 3 * self.d_head, bias=config.bias)
+            for _ in range(self.n_head)
+        ]
 
     def forward(self, x):
-        # (B x T x C), but right now we are doing single head, batch=1.
-        # TODO: where does n_head fit in here?
-        B, T, C = x.size()
-        pass
+        B, T, C = x.size()  # (B, T, n_embd)
+
+        # Single-head
+        if 0:
+            attn = self.c_attn(x)  # (B, T, 3*n_embd)
+            Q = attn[:,:,0:self.n_embd]  # (B, T, n_embd)
+            K = attn[:,:,self.n_embd: 2*self.n_embd]
+            V = attn[:,:,2*self.n_embd: 3*self.n_embd]
+            attn =  F.softmax(Q @ K.transpose(1,2)) @ V / torch.sqrt(torch.tensor(self.n_embd))
+            x = self.c_proj(attn)
+
+        # Multi-head via loops
+        if 0:
+            # d_head = d_model / n_head = n_embd / n_head
+            result = torch.empty_like(x)  # (B, T, n_embd)
+            for head_idx in range(self.n_head):
+                attn = self.c_attn_array[head_idx](x)  # (B, T, n_embd) @ (n_embd, 3*d_head) = (B, T, 3*d_head)
+                Q = attn[:,:,0:self.d_head]  # (B, T, d_head)
+                K = attn[:,:,self.d_head: 2*self.d_head]
+                V = attn[:,:,2*self.d_head: 3*self.d_head]
+                attn =  F.softmax(Q @ K.transpose(1,2)) @ V / torch.sqrt(torch.tensor(self.d_head))
+                # Q @ K.transpose(1,2) = ((B, T, d_head)) @ (B, d_head, T) = (B, T, T)
+                # result: (B, T, T) @ (B, T, d_head) = (B, T, d_head)
+                result[:, :, head_idx * self.d_head: (head_idx+1) * self.d_head] = attn
+
+            # concat x_array into one big tensor.
+            x = self.c_proj(result)
+
+        # Parallelize head computation via an extra dimension
+        # make d_head/n_head a dimension in the matmul itself
+        if 1:
+            # (B, n_head, T, d_head)  # we want Q, K, V to have this shape
+            attn= self.c_attn(x) # (B, T, 3*n_embd)
+            attn = torch.reshape(attn, (B, T, 3, self.n_head, self.d_head)).transpose(1,3) # (B, n_head, {q,k,v}, T, d_head)
+            Q = attn[:,:,0,:,:] # (B, n_head, T, d_head)
+            K = attn[:,:,1,:,:] # (B, n_head, T, d_head)
+            V = attn[:,:,2,:,:] # (B, n_head, T, d_head)
+            result =  F.softmax(Q @ K.transpose(2, 3)) @ V / torch.sqrt(torch.tensor(self.d_head))
+            # Q @ K.transpose(1,2) = (B, n_head, T, d_head) @ (B, n_head, d_head, T) = (B, n_head, T, T)
+            # result: (B, n_head, T, T) @ (B, n_head T, d_head) = (B, n_head, T, d_head)
+
+            # untranspose, flatten/reshape
+            # (B, n_head, T, d_head)  --transpose--> (B, T, n_head, d_head)  --reshape--> (B, T, n_embd)
+            result = result.transpose(1,2).reshape((B, T, self.n_embd))
+
+            x = self.c_proj(result)  # (B, T, n_embd) @ (n_embd, n_embd) = (B, T, n_embd)
+            # x.shape=(B, T, n_embd)
+
+        # (B, T, n_embd) = ((B, T, n_embd) @ (B, n_embd, T)) @ (B, T, n_embd)
+        # z.shape = (B, T, n_embd)
+        return x
 
 class MLP(nn.Module):
 
@@ -70,7 +122,11 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        pass
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 class Block(nn.Module):
 
@@ -82,7 +138,15 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        pass
+        z = self.attn(x)
+        # print(f"{x.shape=} {z.shape=}")  # x.shape=torch.Size([12, 64, 128]) z.shape=torch.Size([12, 64, 128])
+        # I expect: x.shape = (batch, time, d_model=n_embd)
+        # I expect x.shape == z.shape
+        x = self.ln_1(x+z)
+        z = self.mlp(x)
+        # print(f"{x.shape=} {z.shape=}")
+        x = self.ln_2(x+z)
+        return x
 
 @dataclass
 class GPTConfig:
@@ -147,7 +211,36 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        pass
+        # print(f"{idx.shape=}")  # (B x T)  (B x T x vocab_size)  # idx.shape=torch.Size([12, 64])
+        x = self.transformer.wte(idx)  # (B x T x vocab_size) @ (vocab_size, n_embd) = (B x T x n_embd)
+
+        # x.shape = [12, 64, 128]  (B x T x n_embd)
+
+        # positions = torch.arange(self.config.block_size)  # (T=block_size)
+        positions = torch.arange(0, self.config.block_size, device=idx.device, dtype=torch.long)
+        position_embeds = self.transformer.wpe(positions)  # (T) @ (T, n_embd) = (T x n_embd)
+        # print(f"{position_embeds.shape=}")
+        x = x + position_embeds  # (B, T, n_embd)
+        # print(f"{x.shape=}")
+
+        x = self.transformer.drop(x)
+
+        for block in self.transformer.h:
+            x = block(x)
+
+        x = self.transformer.ln_f(x)  # TODO: validate...
+
+        y = self.lm_head(x)
+
+        # Reshape for loss
+        # y.shape = (B, T, vocab_size) -> (BxT, vocab_size)
+        # targets.shape = (B, T)  -> (BxT)
+
+        loss = None
+        if targets is not None:
+            loss = torch.nn.functional.cross_entropy(y.view(-1, y.shape[-1]), targets.view(-1))
+
+        return x, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -285,3 +378,24 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+"""
+# Example code to understand the difference between torch.nn.Embedding and torch.nn.Linear
+import torch
+
+with torch.no_grad():
+    block_size = 64
+    n_embd = 128
+
+    # Embedding version
+    # wpe = torch.nn.Embedding(block_size, n_embd)
+    # positions = torch.arange(0, block_size) # (block_size, )
+    # result = wpe(positions)  # (block_size, ) @ (block_size, n_embd)
+    # print(result.shape)  # (64, 128)  ->  (block_size, n_embd)
+
+    # Linear version
+    wpe = torch.nn.Linear(block_size, n_embd, dtype=torch.float)
+    positions = torch.arange(0, block_size**2, dtype=torch.float).reshape(block_size, block_size) # (block_size, block_size)
+    result = wpe(positions)  # (block_size, block_size) @ (block_size, n_embd)
+    print(result.shape)  # (64, 128)  ->  (block_size, n_embd)
+"""
