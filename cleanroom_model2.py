@@ -40,6 +40,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd  # d_model
         self.dropout = config.dropout
+        self.block_size = config.block_size
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         # self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         self.flash = False  # We want to implement self attention manually.
@@ -47,8 +48,7 @@ class CausalSelfAttention(nn.Module):
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             # block_size means the sequence length (T)
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            self.register_buffer("lower", torch.tril(torch.ones(self.block_size, self.block_size)))
 
         assert self.n_embd % self.n_head == 0
         self.d_head = self.n_embd // self.n_head
@@ -61,13 +61,20 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()  # (B, T, n_embd)
 
+        # lower = torch.tril(torch.ones(self.block_size, self.block_size))
+        def apply_mask(data):
+            return data.masked_fill(self.lower[:T, :T] == 0, -torch.inf)  # equiv. to `torch.where(self.lower==1.0, data, -torch.inf)`
+
         # Single-head
         if 0:
             attn = self.c_attn(x)  # (B, T, 3*n_embd)
             Q = attn[:,:,0:self.n_embd]  # (B, T, n_embd)
-            K = attn[:,:,self.n_embd: 2*self.n_embd]
-            V = attn[:,:,2*self.n_embd: 3*self.n_embd]
-            attn =  F.softmax(Q @ K.transpose(1,2)) @ V / torch.sqrt(torch.tensor(self.n_embd))
+            K = attn[:,:,self.n_embd: 2*self.n_embd]  # (B, T, n_embd)
+            V = attn[:,:,2*self.n_embd: 3*self.n_embd]  # (B, T, n_embd)
+            attn = Q @ K.transpose(1,2)  # (B, T, n_embd) @ (B, n_embd, T) = (B, T, T)
+            attn = apply_mask(attn)  # TODO: apply mask
+            attn = F.softmax(attn / torch.sqrt(torch.tensor(self.n_embd)), dim=-1)  # normalize across T dimension (not batch dim).
+            attn = attn @ V  # (B, T, T) @ (B, T, n_embd) = (B, T, n_embd)
             x = self.c_proj(attn)
 
         # Multi-head via loops
@@ -79,9 +86,12 @@ class CausalSelfAttention(nn.Module):
                 Q = attn[:,:,0:self.d_head]  # (B, T, d_head)
                 K = attn[:,:,self.d_head: 2*self.d_head]
                 V = attn[:,:,2*self.d_head: 3*self.d_head]
-                attn =  F.softmax(Q @ K.transpose(1,2)) @ V / torch.sqrt(torch.tensor(self.d_head))
-                # Q @ K.transpose(1,2) = ((B, T, d_head)) @ (B, d_head, T) = (B, T, T)
-                # result: (B, T, T) @ (B, T, d_head) = (B, T, d_head)
+                attn = Q @ K.transpose(1,2)
+                # Q @ K.transpose(1,2) = (B, T, d_head) @ (B, d_head, T) = (B, T, T)
+                # apply mask
+                attn = apply_mask(attn)
+                attn =  F.softmax(attn / torch.sqrt(torch.tensor(self.d_head)), dim=-1)
+                attn = attn @ V  # (B, T, T) @ (B, T, d_head) = (B, T, d_head)
                 result[:, :, head_idx * self.d_head: (head_idx+1) * self.d_head] = attn
 
             # concat x_array into one big tensor.
@@ -96,19 +106,20 @@ class CausalSelfAttention(nn.Module):
             Q = attn[:,:,0,:,:] # (B, n_head, T, d_head)
             K = attn[:,:,1,:,:] # (B, n_head, T, d_head)
             V = attn[:,:,2,:,:] # (B, n_head, T, d_head)
-            result =  F.softmax(Q @ K.transpose(2, 3)) @ V / torch.sqrt(torch.tensor(self.d_head))
-            # Q @ K.transpose(1,2) = (B, n_head, T, d_head) @ (B, n_head, d_head, T) = (B, n_head, T, T)
-            # result: (B, n_head, T, T) @ (B, n_head T, d_head) = (B, n_head, T, d_head)
+            attn = Q @ K.transpose(2, 3)  # Q @ K.transpose(2,3) = (B, n_head, T, d_head) @ (B, n_head, d_head, T) = (B, n_head, T, T)
+            # apply mask
+            attn = apply_mask(attn)
+            attn = F.softmax(attn / torch.sqrt(torch.tensor(self.d_head)), dim=-1)
+            result = attn @ V  # (B, n_head, T, T) @ (B, n_head T, d_head) = (B, n_head, T, d_head)
 
             # untranspose, flatten/reshape
             # (B, n_head, T, d_head)  --transpose--> (B, T, n_head, d_head)  --reshape--> (B, T, n_embd)
             result = result.transpose(1,2).reshape((B, T, self.n_embd))
 
             x = self.c_proj(result)  # (B, T, n_embd) @ (n_embd, n_embd) = (B, T, n_embd)
-            # x.shape=(B, T, n_embd)
 
         # (B, T, n_embd) = ((B, T, n_embd) @ (B, n_embd, T)) @ (B, T, n_embd)
-        # z.shape = (B, T, n_embd)
+        # x.shape = (B, T, n_embd)
         return x
 
 class MLP(nn.Module):
@@ -211,17 +222,13 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        # print(f"{idx.shape=}")  # (B x T)  (B x T x vocab_size)  # idx.shape=torch.Size([12, 64])
         x = self.transformer.wte(idx)  # (B x T x vocab_size) @ (vocab_size, n_embd) = (B x T x n_embd)
 
         # x.shape = [12, 64, 128]  (B x T x n_embd)
 
-        # positions = torch.arange(self.config.block_size)  # (T=block_size)
         positions = torch.arange(0, self.config.block_size, device=idx.device, dtype=torch.long)
         position_embeds = self.transformer.wpe(positions)  # (T) @ (T, n_embd) = (T x n_embd)
-        # print(f"{position_embeds.shape=}")
         x = x + position_embeds  # (B, T, n_embd)
-        # print(f"{x.shape=}")
 
         x = self.transformer.drop(x)
 
